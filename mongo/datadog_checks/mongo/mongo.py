@@ -13,7 +13,7 @@ from datadog_checks.base import AgentCheck, ConfigurationError, is_affirmative
 from datadog_checks.base.utils.common import exclude_undefined_keys
 from datadog_checks.mongo.collectors import (
     CollStatsCollector,
-    CurrentOpCollector,
+    FsyncLockCollector,
     CustomQueriesCollector,
     DbStatCollector,
     IndexStatsCollector,
@@ -158,10 +158,49 @@ class MongoDb(AgentCheck):
         self.custom_queries = self.instance.get("custom_queries", [])
         # By default consider that this instance is a standalone, updated on each check run.
         self.deployment_type = StandaloneDeploymentType()
+        self.collectors = []
 
     @classmethod
     def get_library_versions(cls):
         return {'pymongo': pymongo.version}
+
+    def update_collectors(self, mongo_version, all_dbs, tags):
+        collectors = []
+        if isinstance(self.deployment_type, ReplicaSetDeploymentType):
+            if self.replica_check:
+                collectors.append(ReplicaCollector(self, tags, is_primary=self.deployment_type.is_primary))
+            collectors.append(ReplicationInfoCollector(self, tags))
+
+        if not isinstance(self.deployment_type, MongosDeploymentType):
+            # The local database contains different information on each node.
+            # But is only available for mongod instances.
+            collectors.append(DbStatCollector(self, "local", tags))
+            collectors.append(FsyncLockCollector(self, self.db_name, tags))
+            if 'top' in self.additional_metrics:
+                collectors.append(TopCollector(self, tags))
+
+        if self.deployment_type.is_principal():
+            if self.db_name not in all_dbs:
+                raise ConfigurationError(
+                    "Configured database {} does not exist. Available databases are {}.".format(self.db_name, all_dbs)
+                )
+            if 'local' in all_dbs:
+                # Already monitored for all instances
+                all_dbs.remove('local')
+            for db_n in all_dbs:
+                collectors.append(DbStatCollector(self, db_n, tags))
+
+            if self.collections_indexes_stats:
+                if LooseVersion(mongo_version) >= LooseVersion("3.2"):
+                    collectors.append(IndexStatsCollector(self, self.db_name, tags, self.coll_names))
+                else:
+                    msg = "'collections_indexes_stats' is only available starting from mongo 3.2: "
+                    "your mongo version is %s"
+                    self.log.error(msg, mongo_version)
+            collectors.append(CollStatsCollector(self, self.db_name, tags, coll_names=self.coll_names))
+            collectors.append(CustomQueriesCollector(self, self.db_name, tags, self.custom_queries))
+
+        collectors.append(ServerStatusCollector(self, self.db_name, tags, tcmalloc=self.collect_tcmalloc_metrics))
 
     def _build_metric_list_to_collect(self):
         """
@@ -224,15 +263,20 @@ class MongoDb(AgentCheck):
 
         return authenticated
 
-    def update_deployment_type(self, admindb):
-        props = admindb.command("isMaster")
-        if props.get("ismaster") == "isdbgrid":
-            self.deployment_type = MongosDeploymentType()
-        elif props.get("hosts"):
+    @staticmethod
+    def get_deployment_type(admindb):
+        options = admindb.command("getCmdLineOpts")
+        if 'sharding' in options:
+            if 'configDB' in options['sharding']:
+                return MongosDeploymentType()
+            elif 'clusterRole' in options['sharding']:
+                repl_set_payload = admindb.command("replSetGetStatus")
+                return ReplicaSetDeploymentType(repl_set_payload, in_shard=True)
+        elif 'replSetName' in options.get('replication', {}):
             repl_set_payload = admindb.command("replSetGetStatus")
-            self.deployment_type = ReplicaSetDeploymentType(repl_set_payload)
-        else:
-            self.deployment_type = StandaloneDeploymentType()
+            return ReplicaSetDeploymentType(repl_set_payload, in_shard=False)
+
+        return StandaloneDeploymentType()
 
     def check(self, _):
         try:
@@ -251,9 +295,20 @@ class MongoDb(AgentCheck):
             self.service_check(SERVICE_CHECK_NAME, AgentCheck.CRITICAL, tags=self.service_check_tags)
             raise
 
+        try:
+            mongo_version = cli.server_info().get('version', '0.0')
+            self.set_metadata('version', mongo_version)
+        except Exception:
+            self.service_check(SERVICE_CHECK_NAME, AgentCheck.CRITICAL, tags=self.service_check_tags)
+            self.log.exception("Error when collecting the version from the mongo server.")
+            raise
+        else:
+            self.service_check(SERVICE_CHECK_NAME, AgentCheck.OK, tags=self.service_check_tags)
+
         tags = deepcopy(self.base_tags)
 
-        self.update_deployment_type(cli['admin'])
+        new_deployment_type = self.get_deployment_type(cli['admin'])
+        if
         if isinstance(self.deployment_type, ReplicaSetDeploymentType):
             tags.extend(
                 [
@@ -261,13 +316,6 @@ class MongoDb(AgentCheck):
                     "replset_state:{}".format(self.deployment_type.replset_state_name),
                 ]
             )
-
-        try:
-            mongo_version = cli.server_info().get('version', '0.0')
-            self.set_metadata('version', mongo_version)
-        except Exception:
-            self.log.exception("Error when collecting the version from the mongo server.")
-            mongo_version = '0.0'
 
         collector = ServerStatusCollector(self, self.db_name, tags, tcmalloc=self.collect_tcmalloc_metrics)
         try:
@@ -284,58 +332,8 @@ class MongoDb(AgentCheck):
         collector = DbStatCollector(self, self.db_name, tags)
         collector.collect(cli)
 
-        # Handle replica data, if any
-        # See
-        # http://www.mongodb.org/display/DOCS/Replica+Set+Commands#ReplicaSetCommands-replSetGetStatus  # noqa
-        if self.replica_check and isinstance(self.deployment_type, ReplicaSetDeploymentType):
-            collector = ReplicaCollector(self, tags, self._previous_state)
-            try:
-                collector.collect(cli)
-                self._previous_state = self.deployment_type.replset_state
-            except Exception as e:
-                if "OperationFailure" in repr(e) and (
-                    "not running with --replSet" in str(e) or "replSetGetStatus" in str(e)
-                ):
-                    pass
-                else:
-                    raise e
 
         dbnames = cli.list_database_names()
         self.gauge('mongodb.dbs', len(dbnames), tags=tags)
 
-        for db_n in dbnames:
-            collector = DbStatCollector(self, db_n, tags)
-            collector.collect(cli)
 
-        if self.collections_indexes_stats:
-            if LooseVersion(mongo_version) >= LooseVersion("3.2"):
-                collector = IndexStatsCollector(self, self.db_name, tags, self.coll_names)
-                collector.collect(cli)
-            else:
-                msg = "'collections_indexes_stats' is only available starting from mongo 3.2: your mongo version is %s"
-                self.log.error(msg, mongo_version)
-
-        # Report the usage metrics for dbs/collections
-        if 'top' in self.additional_metrics:
-            try:
-                collector = TopCollector(self, tags)
-                collector.collect(cli)
-            except Exception as e:
-                self.log.warning('Failed to record `top` metrics %s', e)
-
-        if 'local' in dbnames:  # it might not be if we are connecting through mongos
-            collector = ReplicationInfoCollector(self, tags)
-            collector.collect(cli)
-        else:
-            self.log.debug('"local" database not in dbnames. Not collecting ReplicationInfo metrics')
-
-        # get collection level stats
-        try:
-            collector = CollStatsCollector(self, self.db_name, tags, coll_names=self.coll_names)
-            collector.collect(cli)
-        except Exception as e:
-            self.log.warning(u"Failed to record `collection` metrics.")
-            self.log.exception(e)
-
-        collector = CustomQueriesCollector(self, self.db_name, tags, self.custom_queries)
-        collector.collect(cli)

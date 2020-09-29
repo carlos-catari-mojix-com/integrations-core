@@ -3,7 +3,7 @@ import time
 from six.moves.urllib.parse import urlsplit
 
 from datadog_checks.mongo.collectors.base import MongoCollector
-from datadog_checks.mongo.common import REPLSET_MEMBER_STATES, SOURCE_TYPE_NAME, get_state_name
+from datadog_checks.mongo.common import SOURCE_TYPE_NAME, get_long_state_name, get_state_name
 
 try:
     import datadog_agent
@@ -16,11 +16,11 @@ class ReplicaCollector(MongoCollector):
     in order to submit events on any status change.
     """
 
-    def __init__(self, check, tags, last_state):
+    def __init__(self, check, tags, is_primary=False):
         super(ReplicaCollector, self).__init__(check, "admin", tags)
         # Members' last replica set states
-        self._last_state = last_state
-
+        self._last_states = {}
+        self.is_primary = is_primary
         # Makes a reasonable hostname for a replset membership event to mention.
         uri = urlsplit(self.check.clean_server_name)
         if '@' in uri.netloc:
@@ -30,41 +30,60 @@ class ReplicaCollector(MongoCollector):
         if self.hostname == 'localhost':
             self.hostname = datadog_agent.get_hostname()
 
-    def _report_replica_set_state(self, state, replset_name):
+    def _report_replica_set_states(self, members, replset_name):
         """
         Report the member's replica set state
         * Submit a service check.
         * Create an event on state change.
         """
-        if self._last_state == state or self._last_state == -1:
-            return
 
-        status = (
-            REPLSET_MEMBER_STATES[state][1]
-            if state in REPLSET_MEMBER_STATES
-            else 'Replset state %d is unknown to the Datadog agent' % state
-        )
-        short_status = get_state_name(state)
-        last_short_status = get_state_name(self._last_state)
-        msg_title = "%s is %s for %s" % (self.hostname, short_status, replset_name)
-        msg = "MongoDB %s (%s) just reported as %s (%s) for %s; it was %s before."
-        msg = msg % (self.hostname, self.check.clean_server_name, status, short_status, replset_name, last_short_status)
+        for member in members:
+            # The id field cannot be changed for a given replica set member.
+            member_id = member['_id']
+            status_id = member['state']
+            old_state = self._last_states.get(member_id)
+            if not old_state:
+                # First time the agent sees this replica set member.
+                continue
 
-        self.check.event(
-            {
+            if old_state == status_id:
+                continue
+            old_state_str = get_state_name(old_state)
+            status_str = get_state_name(status_id)
+            status_long_str = get_long_state_name(status_id)
+            node_hostname = member['name']
+
+            msg_title = "{} is {} for {}".format(node_hostname, status_str, replset_name)
+            msg = (
+                "MongoDB {node} (_id: {id}, {uri}) just reported as {status} ({status_short}) "
+                "for {replset_name}; it was {old_state} before.".format(
+                    node=node_hostname,
+                    id=member_id,
+                    uri=self.check.clean_server_name,
+                    status=status_long_str,
+                    status_short=status_str,
+                    replset_name=replset_name,
+                    old_state=old_state_str,
+                )
+            )
+
+            event_payload = {
                 'timestamp': int(time.time()),
                 'source_type_name': SOURCE_TYPE_NAME,
                 'msg_title': msg_title,
                 'msg_text': msg,
-                'host': self.hostname,
+                'host': node_hostname,
                 'tags': [
                     'action:mongo_replset_member_status_change',
-                    'member_status:' + short_status,
-                    'previous_member_status:' + last_short_status,
+                    'member_status:' + status_str,
+                    'previous_member_status:' + old_state_str,
                     'replset:' + replset_name,
                 ],
             }
-        )
+            if node_hostname != 'localhost':
+                # Do not submit events with a 'localhost' hostname.
+                event_payload['host'] = node_hostname
+            self.check.event(event_payload)
 
     def collect(self, client):
         db = client["admin"]
@@ -101,4 +120,8 @@ class ReplicaCollector(MongoCollector):
         result['state'] = status['myState']
 
         self._submit_payload({'replSet': result})
-        self._report_replica_set_state(status['myState'], status['set'])
+        if self.is_primary:
+            replset_name = status['set']
+            self._report_replica_set_states(status['members'], replset_name)
+
+        self._last_states = {member['_id']: member['state'] for member in status['members']}

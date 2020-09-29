@@ -1,6 +1,6 @@
 from .base import MongoCollector
 from .coll_stats import CollStatsCollector
-from .current_op import CurrentOpCollector
+from .fsynclock import FsyncLockCollector
 from .custom_queries import CustomQueriesCollector
 from .db_stat import DbStatCollector
 from .index_stats import IndexStatsCollector
